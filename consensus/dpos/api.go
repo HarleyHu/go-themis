@@ -19,7 +19,7 @@ type API struct {
 
 type ProducerInfo struct {
 	Addr   common.Address `json:"addr"               gencodec:"required"`
-	Weight *big.Int       `json:"weight"                  gencodec:"required"`
+	Weight *big.Int       `json:"weight"             gencodec:"required"`
 }
 
 // Get all producers info of json
