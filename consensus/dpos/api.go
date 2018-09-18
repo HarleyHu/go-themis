@@ -7,6 +7,7 @@ import (
 	"github.com/themis-network/go-themis/common"
 	"github.com/themis-network/go-themis/consensus"
 	"github.com/themis-network/go-themis/core"
+	"github.com/themis-network/go-themis/core/types"
 )
 
 // API is a user facing RPC API to allow controlling the signer and voting
@@ -49,9 +50,6 @@ type ProposalInfo struct {
 }
 
 var (
-	// Error info
-	errInvalidInput = errors.New("invalid input")
-
 	// Contract name
 	regContract  = "system.regContract"
 	voteContract = "system.voteContract"
@@ -64,14 +62,11 @@ func NewAPI(chain consensus.ChainReader, dpos *Dpos) *API {
 	}
 }
 
-// Get active producers of the giving block number
-func (api *API) GetActiveProducers(blockNumber *big.Int) ([]common.Address, error) {
+func (api *API) getValidHeader(blockNumber *big.Int) (*types.Header, error) {
 	// Retrieve the requested block number (or current if none requested)
 	header := api.chain.CurrentHeader()
-	if blockNumber != nil && (*blockNumber).Cmp(big.NewInt(0)) > 0 && (*blockNumber).Cmp(header.Number) < 0 {
+	if blockNumber != nil {
 		header = api.chain.GetHeaderByNumber(blockNumber.Uint64())
-	} else if blockNumber != nil && ((*blockNumber).Cmp(big.NewInt(0)) < 0 || (*blockNumber).Cmp(header.Number) > 0) {
-		return nil, errInvalidInput
 	}
 
 	// Ensure we have an actually valid block
@@ -79,103 +74,48 @@ func (api *API) GetActiveProducers(blockNumber *big.Int) ([]common.Address, erro
 		return nil, errUnknownBlock
 	}
 
-	return (*header).ActiveProducers, nil
+	return header, nil
+}
+
+// Get active producers of the giving block number
+func (api *API) GetActiveProducers(blockNumber *big.Int) ([]common.Address, error) {
+	header, err := api.getValidHeader(blockNumber)
+	if err != nil {
+		return nil, err
+	}
+
+	return header.ActiveProducers, nil
 }
 
 // Get pending producer of the giving block number
 func (api *API) GetPendingProducer(blockNumber *big.Int) ([]common.Address, error) {
-	// Retrieve the requested block number (or current if none requested)
-	header := api.chain.CurrentHeader()
-	if blockNumber != nil && (*blockNumber).Cmp(big.NewInt(0)) > 0 && (*blockNumber).Cmp(header.Number) < 0 {
-		header = api.chain.GetHeaderByNumber(blockNumber.Uint64())
-	} else if blockNumber != nil && ((*blockNumber).Cmp(big.NewInt(0)) < 0 || (*blockNumber).Cmp(header.Number) > 0) {
-		return nil, errInvalidInput
+	header, err := api.getValidHeader(blockNumber)
+	if err != nil {
+		return nil, err
 	}
 
-	// Ensure we have an actually valid block
-	if header == nil {
-		return nil, errUnknownBlock
-	}
-
-	return (*header).PendingProducers, nil
+	return header.PendingProducers, nil
 }
 
 // Get all producers info by evm
 func (api *API) GetAllProducers(blockNumber *big.Int, sizeNumber *big.Int) (*ProducersInfo, error) {
-	methodString := "getAllProducersInfo"
-	// Retrieve the requested block number (or current if none requested)
-	header := api.chain.CurrentHeader()
-	if blockNumber != nil && (*blockNumber).Cmp(big.NewInt(0)) > 0 && (*blockNumber).Cmp(header.Number) < 0 {
-		header = api.chain.GetHeaderByNumber(blockNumber.Uint64())
-	} else if blockNumber != nil && ((*blockNumber).Cmp(big.NewInt(0)) < 0 || (*blockNumber).Cmp(header.Number) > 0) {
-		return nil, errInvalidInput
-	}
-
-	// Ensure we have an actually valid block
-	if header == nil {
-		return nil, errUnknownBlock
-	}
-
-	// Get system contract address
-	sysAddress, err := api.GetSystemContract(regContract)
-	if err != nil {
-		return nil, errors.New("can't get reg contract address")
-	}
-
-	caller := core.NewSystemContractCaller()
-	inputData, err := caller.RegABI().Pack(methodString)
+	header, err := api.getValidHeader(blockNumber)
 	if err != nil {
 		return nil, err
 	}
 
-	call := core.NewCallMsg(sysAddress, inputData, header.Number.Uint64())
-	data, err := api.dpos.Call(call)
+	producers, weights, amount, err := api.dpos.GetAllSortedProducers(api.chain, header)
 	if err != nil {
 		return nil, err
 	}
-
-	var (
-		ret0 = new([]common.Address)
-		ret1 = new([]*big.Int)
-		ret2 = new(*big.Int)
-	)
-	out := &[]interface{}{
-		ret0,
-		ret1,
-		ret2,
-	}
-
-	err = caller.RegABI().Unpack(out, methodString, data)
-	if err != nil {
-		return nil, err
-	}
-
-	// Get all producers info
-	producersAddr := *ret0
-	weight := *ret1
-	amount := *ret2
-
-	// Sort all weight of producers
-	var i uint64
-	sortTable := sortNumSlice{}
-	for i, voteWeight := range weight {
-		sortTable = append(sortTable, &sortNum{i, voteWeight})
-	}
-
-	// Negative number for all producers, zero for pending producers, positive number for producers of given number.
+	// Negative number and zero for all producers, positive number for producers of given number.
 	var getNumber uint64
-	len := uint64(len(weight))
-	size := (*sizeNumber).Int64()
-	if size < 0 {
+	len := uint64(len(producers))
+	size := sizeNumber.Int64()
+	if size <= 0 {
 		getNumber = len
-	} else if size == 0 {
-		// Cancel proposal if can not get enough producers
-		if amount.Uint64() > len {
-			return nil, errTooFewProducers
-		}
-		getNumber = amount.Uint64()
 	} else {
-		if uint64(size) > len {
+		if size > int64(len) {
 			getNumber = len
 		} else {
 			getNumber = uint64(size)
@@ -183,12 +123,11 @@ func (api *API) GetAllProducers(blockNumber *big.Int, sizeNumber *big.Int) (*Pro
 	}
 
 	// Get top producers of given number
-	sortedProducers := sortTable.GetTop(getNumber)
 	topProducers := make([]ProducerInfo, 0)
-	for i = 0; i < getNumber; i++ {
+	for i := 0; i < int(getNumber); i++ {
 		topProducers = append(topProducers, ProducerInfo{
-			Addr:   producersAddr[sortedProducers[i].serial],
-			Weight: sortedProducers[i].num,
+			Addr:   producers[i],
+			Weight: weights[i],
 		})
 	}
 
@@ -201,17 +140,9 @@ func (api *API) GetAllProducers(blockNumber *big.Int, sizeNumber *big.Int) (*Pro
 }
 
 func (api *API) GetVoteInfo(addr *common.Address, blockNumber *big.Int) (*Voteinfo, error) {
-	// Retrieve the requested block number (or current if none requested)
-	header := api.chain.CurrentHeader()
-	if blockNumber != nil && (*blockNumber).Cmp(big.NewInt(0)) > 0 && (*blockNumber).Cmp(header.Number) < 0 {
-		header = api.chain.GetHeaderByNumber(blockNumber.Uint64())
-	} else if blockNumber != nil && ((*blockNumber).Cmp(big.NewInt(0)) < 0 || (*blockNumber).Cmp(header.Number) > 0) {
-		return nil, errInvalidInput
-	}
-
-	// Ensure we have an actually valid block
-	if header == nil {
-		return nil, errUnknownBlock
+	header, err := api.getValidHeader(blockNumber)
+	if err != nil {
+		return nil, err
 	}
 
 	voteAddress, err := api.GetSystemContract(voteContract)
@@ -260,17 +191,9 @@ func (api *API) GetVoteInfo(addr *common.Address, blockNumber *big.Int) (*Votein
 }
 
 func (api *API) GetProposal(blockNumber *big.Int) (*ProposalInfo, error) {
-	// Retrieve the requested block number (or current if none requested)
-	header := api.chain.CurrentHeader()
-	if blockNumber != nil && (*blockNumber).Cmp(big.NewInt(0)) > 0 && (*blockNumber).Cmp(header.Number) < 0 {
-		header = api.chain.GetHeaderByNumber(blockNumber.Uint64())
-	} else if blockNumber != nil && ((*blockNumber).Cmp(big.NewInt(0)) < 0 || (*blockNumber).Cmp(header.Number) > 0) {
-		return nil, errInvalidInput
-	}
-
-	// Ensure we have an actually valid block
-	if header == nil {
-		return nil, errUnknownBlock
+	header, err := api.getValidHeader(blockNumber)
+	if err != nil {
+		return nil, err
 	}
 
 	caller := core.NewSystemContractCaller()
